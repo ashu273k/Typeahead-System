@@ -2,6 +2,13 @@ import express from 'express';
 import pg from 'pg';
 import { createClient } from 'redis';
 
+// Service Imports
+import { HashRing } from './src/services/HashRing.js';
+import { CacheService } from './src/services/CacheService.js';
+import { DatabaseService } from './src/services/DatabaseService.js';
+import { MetricsService } from './src/services/MetricsService.js';
+import { BatchWriter } from './src/services/BatchWriter.js';
+
 const app = express();
 const port = process.env.PORT || 3001;
 
@@ -17,13 +24,45 @@ app.use((req, res, next) => {
   next();
 });
 
-// Configuration from environment variables with sensible defaults for Docker Compose
+// Environment Configurations
 const pgConfig = {
   connectionString: process.env.DATABASE_URL || 'postgresql://postgres:postgres@postgres:5432/postgres'
 };
 
-// Initialize PostgreSQL connection pool
+const redis1Url = process.env.REDIS_1_URL || 'redis://redis-1:6379';
+const redis2Url = process.env.REDIS_2_URL || 'redis://redis-2:6380';
+
+// Initialize PostgreSQL pool and wrap it in DatabaseService (Dependency Inversion Principle)
 const pool = new pg.Pool(pgConfig);
+const dbService = new DatabaseService(pool);
+
+// Initialize Redis client nodes
+const redisClient1 = createClient({ url: redis1Url });
+const redisClient2 = createClient({ url: redis2Url });
+
+redisClient1.on('error', (err) => console.error('Redis 1 Client Error', err));
+redisClient2.on('error', (err) => console.error('Redis 2 Client Error', err));
+
+await redisClient1.connect().catch(err => console.error('Failed to connect to Redis 1:', err));
+await redisClient2.connect().catch(err => console.error('Failed to connect to Redis 2:', err));
+
+// Initialize Consistent Hash Ring and CacheService
+const hashRing = new HashRing(21);
+const cacheService = new CacheService(hashRing);
+
+// Register Redis instances as cache-node-1 and cache-node-2
+cacheService.registerNode('cache-node-1', redisClient1);
+cacheService.registerNode('cache-node-2', redisClient2);
+
+// Initialize Telemetry and Batch Writing Services
+const metricsService = new MetricsService();
+const batchWriter = new BatchWriter(dbService, metricsService, {
+  flushIntervalMs: 30000,
+  bufferLimit: 100
+});
+
+// Start the background writer buffer flush scheduler
+batchWriter.start();
 
 // Helper function to measure response time in milliseconds
 function getDurationInMs(startTime) {
@@ -31,113 +70,14 @@ function getDurationInMs(startTime) {
   return (diff[0] * 1000) + (diff[1] / 1e6);
 }
 
-const redis1Url = process.env.REDIS_1_URL || 'redis://redis-1:6379';
-const redis2Url = process.env.REDIS_2_URL || 'redis://redis-2:6380';
+// REST Route Endpoints
 
-// In-memory buffer variables for batch writing
-let searchBuffer = [];
-let flushTimeout = null;
-let isFlushing = false;
-
-// Schedule the background flush timer (runs every 30 seconds)
-function scheduleFlush() {
-  if (flushTimeout) clearTimeout(flushTimeout);
-  flushTimeout = setTimeout(flush, 30000);
-}
-
-// Flush buffer to database
-async function flush() {
-  if (isFlushing || searchBuffer.length === 0) {
-    scheduleFlush();
-    return;
-  }
-
-  isFlushing = true;
-  if (flushTimeout) clearTimeout(flushTimeout);
-
-  const itemsToFlush = [...searchBuffer];
-  searchBuffer = [];
-
-  try {
-    const flushedCount = itemsToFlush.length;
-    console.log(`[BatchWriter] Flushing ${flushedCount} updates`);
-
-    // Aggregate duplicates for queries table (e.g., "iphone" x 4 -> "iphone" +4)
-    const aggregates = {};
-    for (const item of itemsToFlush) {
-      const q = item.query;
-      aggregates[q] = (aggregates[q] || 0) + 1;
-    }
-
-    const uniqueQueries = Object.keys(aggregates);
-
-    if (uniqueQueries.length > 0) {
-      await pool.query('BEGIN');
-
-      // 1. Bulk Upsert into queries table (add to existing count)
-      const queriesValues = [];
-      const queriesPlaceholders = [];
-      for (let j = 0; j < uniqueQueries.length; j++) {
-        const q = uniqueQueries[j];
-        queriesPlaceholders.push(`($${j * 2 + 1}, $${j * 2 + 2})`);
-        queriesValues.push(q, aggregates[q]);
-      }
-
-      const queriesSql = `
-        INSERT INTO queries (query, count) 
-        VALUES ${queriesPlaceholders.join(', ')} 
-        ON CONFLICT (query) 
-        DO UPDATE SET count = queries.count + EXCLUDED.count;
-      `;
-      await pool.query(queriesSql, queriesValues);
-
-      // 2. Bulk Insert into search_events table
-      const eventsValues = [];
-      const eventsPlaceholders = [];
-      for (let j = 0; j < itemsToFlush.length; j++) {
-        const item = itemsToFlush[j];
-        eventsPlaceholders.push(`($${j * 2 + 1}, $${j * 2 + 2})`);
-        eventsValues.push(item.query, item.searchedAt);
-      }
-
-      const eventsSql = `
-        INSERT INTO search_events (query, searched_at) 
-        VALUES ${eventsPlaceholders.join(', ')};
-      `;
-      await pool.query(eventsSql, eventsValues);
-
-      await pool.query('COMMIT');
-    }
-  } catch (err) {
-    console.error('[BatchWriter Error] Failed to flush search events:', err);
-    try {
-      await pool.query('ROLLBACK');
-    } catch (rbErr) {}
-  } finally {
-    isFlushing = false;
-    scheduleFlush();
-  }
-}
-
-// Add query event to in-memory buffer
-function addSearchEvent(query) {
-  searchBuffer.push({ query, searchedAt: new Date() });
-  
-  if (searchBuffer.length >= 100) {
-    console.log(`[BatchWriter] Buffer limit hit (100 items). Flushing immediately.`);
-    flush();
-  }
-}
-
-// Start the background timer
-scheduleFlush();
-
-// Health endpoint returning { "status": "ok" }
+// Health Check
 app.get('/health', (req, res) => {
   res.json({ status: "ok" });
 });
 
-// An endpoint to explicitly test and return reachability status of services
+// Connections reachability test
 app.get('/test-connections', async (req, res) => {
   const status = {
     postgres: 'unknown',
@@ -145,7 +85,6 @@ app.get('/test-connections', async (req, res) => {
     'redis-2': 'unknown'
   };
 
-  // 1. Test Postgres
   try {
     const client = new pg.Client(pgConfig);
     await client.connect();
@@ -156,7 +95,6 @@ app.get('/test-connections', async (req, res) => {
     status.postgres = `unreachable: ${err.message}`;
   }
 
-  // 2. Test Redis-1
   try {
     const client = createClient({ url: redis1Url });
     await client.connect();
@@ -167,7 +105,6 @@ app.get('/test-connections', async (req, res) => {
     status['redis-1'] = `unreachable: ${err.message}`;
   }
 
-  // 3. Test Redis-2
   try {
     const client = createClient({ url: redis2Url });
     await client.connect();
@@ -181,40 +118,52 @@ app.get('/test-connections', async (req, res) => {
   res.json(status);
 });
 
-// Suggestion API (no cache yet)
+// Autocomplete prefix suggestion endpoint (DIP & SOLID)
 app.get('/suggest', async (req, res) => {
   const startTime = process.hrtime();
   try {
     const rawQuery = req.query.q;
     
-    // Handle empty input
     if (!rawQuery || typeof rawQuery !== 'string') {
-      const duration = getDurationInMs(startTime);
-      console.log(`[Suggest DB] q="" | Time: ${duration.toFixed(2)}ms | Results: 0`);
       return res.json([]);
     }
     
-    // Lowercase and trim normalization
     const queryStr = rawQuery.trim().toLowerCase();
     if (queryStr === '') {
-      const duration = getDurationInMs(startTime);
-      console.log(`[Suggest DB] q="" | Time: ${duration.toFixed(2)}ms | Results: 0`);
       return res.json([]);
     }
+
+    const cacheKey = `suggest:${queryStr}`;
     
-    // Query PostgreSQL using LIKE for prefix search, order by count descending, limit 10
-    const sql = `
-      SELECT query 
-      FROM queries 
-      WHERE query LIKE $1 
-      ORDER BY count DESC 
-      LIMIT 10
-    `;
-    const searchPattern = `${queryStr}%`;
-    const dbRes = await pool.query(sql, [searchPattern]);
+    // 1. Check cache first
+    try {
+      const cachedVal = await cacheService.get(cacheKey);
+      if (cachedVal) {
+        const suggestions = JSON.parse(cachedVal);
+        const duration = getDurationInMs(startTime);
+        metricsService.recordHit(duration);
+        console.log(`[Suggest Cache] HIT | node: ${cacheService.getNodeNameForKey(queryStr)} | q="${queryStr}" | Time: ${duration.toFixed(2)}ms`);
+        return res.json(suggestions);
+      }
+    } catch (cacheErr) {
+      console.error(`[Suggest Cache Error] Failed to read from cache:`, cacheErr.message);
+    }
     
-    const suggestions = dbRes.rows.map(row => row.query);
+    // 2. Cache MISS: Query PostgreSQL using databaseService
+    const nodeName = cacheService.getNodeNameForKey(queryStr);
+    console.log(`[Suggest Cache] MISS | node: ${nodeName} | q="${queryStr}" | Querying DB`);
+    
+    const suggestions = await dbService.getSuggestions(queryStr);
+    
+    // 3. Write back to Redis
+    try {
+      await cacheService.set(cacheKey, JSON.stringify(suggestions), 60);
+    } catch (cacheErr) {
+      console.error(`[Suggest Cache Error] Failed to write cache:`, cacheErr.message);
+    }
+    
     const duration = getDurationInMs(startTime);
+    metricsService.recordMiss(duration);
     console.log(`[Suggest DB] q="${queryStr}" | Time: ${duration.toFixed(2)}ms | Results: ${suggestions.length}`);
     
     return res.json(suggestions);
@@ -225,7 +174,68 @@ app.get('/suggest', async (req, res) => {
   }
 });
 
-// Search API (with batch-writing buffer)
+// Cache Debug API (checks node mapping and status)
+app.get('/cache/debug', async (req, res) => {
+  try {
+    const prefix = req.query.prefix;
+    if (!prefix || typeof prefix !== 'string') {
+      return res.status(400).json({ error: 'prefix parameter is required' });
+    }
+    const queryStr = prefix.trim().toLowerCase();
+    const cacheKey = `suggest:${queryStr}`;
+    
+    const nodeName = cacheService.getNodeNameForKey(queryStr);
+    const exists = await cacheService.exists(cacheKey);
+    
+    return res.json({
+      node: nodeName,
+      status: exists === 1 ? 'HIT' : 'MISS'
+    });
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// Telemetry Metrics API
+app.get('/metrics', (req, res) => {
+  res.json(metricsService.getMetrics());
+});
+
+// Trending Queries API (uses DB Service + Cache Service)
+app.get('/trending', async (req, res) => {
+  const startTime = process.hrtime();
+  const cacheKey = 'global:trending';
+
+  try {
+    // 1. Try Cache-node-1
+    const cachedVal = await cacheService.getClientByName('cache-node-1').get(cacheKey);
+    if (cachedVal) {
+      const trending = JSON.parse(cachedVal);
+      const duration = getDurationInMs(startTime);
+      console.log(`[Trending Cache] HIT | Time: ${duration.toFixed(2)}ms | Results: ${trending.length}`);
+      return res.json(trending);
+    }
+
+    // 2. Cache MISS: Query PostgreSQL
+    console.log(`[Trending Cache] MISS | Querying DB`);
+    const trending = await dbService.getTrendingQueries();
+
+    // 3. Cache results for 5 mins (300 seconds) in cache-node-1
+    await cacheService.getClientByName('cache-node-1').set(cacheKey, JSON.stringify(trending), {
+      EX: 300
+    });
+
+    const duration = getDurationInMs(startTime);
+    console.log(`[Trending DB] Time: ${duration.toFixed(2)}ms | Results: ${trending.length}`);
+    return res.json(trending);
+  } catch (err) {
+    const duration = getDurationInMs(startTime);
+    console.error(`[Trending Error] Time: ${duration.toFixed(2)}ms | Error: ${err.message}`);
+    return res.status(500).json({ error: 'Internal Server Error' });
+  }
+});
+
+// Search API (writes to Batch Buffer)
 app.post('/search', (req, res) => {
   const query = req.body?.query;
   if (!query || typeof query !== 'string') {
@@ -237,21 +247,33 @@ app.post('/search', (req, res) => {
     return res.status(400).json({ error: 'Query cannot be empty' });
   }
 
-  // Add query to the batch buffer
-  addSearchEvent(normalizedQuery);
+  // Push to buffer
+  batchWriter.addSearchEvent(normalizedQuery);
 
-  // Return message: "Searched" immediately
   return res.json({ message: "Searched" });
 });
 
-// Hello world fallback
+// Catch-all hello fallback
 app.get('/', (req, res) => {
   res.send('Hello World from Backend!');
 });
 
-app.listen(port, () => {
+const server = app.listen(port, () => {
   console.log(`Backend listening at http://localhost:${port}`);
   console.log(`Configured Postgres: ${pgConfig.connectionString}`);
   console.log(`Configured Redis 1: ${redis1Url}`);
   console.log(`Configured Redis 2: ${redis2Url}`);
+});
+
+// Graceful shutdown handling
+process.on('SIGTERM', () => {
+  console.log('SIGTERM signal received: closing HTTP server');
+  batchWriter.stop();
+  server.close(async () => {
+    console.log('HTTP server closed');
+    await pool.end();
+    await redisClient1.disconnect();
+    await redisClient2.disconnect();
+    console.log('Connections closed cleanly');
+  });
 });
