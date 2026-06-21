@@ -113,7 +113,8 @@ We implemented a consistent hash ring using `MD5` and **21 virtual nodes (replic
 
 ### 3. What is the Weighted Trending Formula?
 We use a weighted score to balance historical queries and current search velocity:
-$$\text{Score} = 0.7 \times \text{historical\_count} + 0.3 \times \text{recent\_count}$$
+$$\text{Score} = 0.7 \cdot H + 0.3 \cdot R$$
+where $H$ = historical count and $R$ = recent velocity count
 * **Why**: Long-term popular queries (like `"iphone"`, count = 3.3M) shouldn't be completely overwritten by a query that goes viral for an hour. Conversely, a brand new viral query (like `"breaking_news"`, total count = 10) must rise immediately into the trending list. The $70/30$ weight balance achieves this naturally.
 
 ### 4. What do you lose if the server crashes?
