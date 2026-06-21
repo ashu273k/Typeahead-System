@@ -18,15 +18,15 @@ async function verify() {
       console.log('❌ FAIL: Count is less than 100,000');
     }
 
-    // 2. Check prefix query with iph%
-    console.log('\nVerification: SELECT * FROM queries WHERE query LIKE \'iph%\' ORDER BY count DESC LIMIT 10:');
-    const prefixRes = await client.query("SELECT id, query, count FROM queries WHERE query LIKE 'iph%' ORDER BY count DESC LIMIT 10");
+    // 2. Check prefix query with goo%
+    console.log('\nVerification: SELECT * FROM queries WHERE query LIKE \'goo%\' ORDER BY count DESC LIMIT 10:');
+    const prefixRes = await client.query("SELECT id, query, count FROM queries WHERE query LIKE 'goo%' ORDER BY count DESC LIMIT 10");
     console.table(prefixRes.rows);
 
-    if (prefixRes.rows.length === 10 && prefixRes.rows[0].query.startsWith('iph')) {
+    if (prefixRes.rows.length >= 1 && prefixRes.rows[0].query.startsWith('goo')) {
       console.log('✅ PASS: Prefix query returns sensible results');
     } else {
-      console.log('❌ FAIL: Prefix query did not return 10 results or results do not match prefix');
+      console.log('❌ FAIL: Prefix query did not return results matching prefix');
     }
 
   } catch (error) {

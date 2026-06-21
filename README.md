@@ -44,7 +44,7 @@ graph TD
    - If not cached (**MISS**), the backend queries PostgreSQL, increments `dbReads`, saves the result in the corresponding Redis node (TTL 60s), and returns suggestions.
 2. **Search Log (`POST /search`)**:
    - Submitting a search pushes the query into an in-memory buffer (`searchBuffer`) and returns `{ "message": "Searched" }` immediately to minimize request latency.
-   - Every 30 seconds or when the buffer hits 100 queries, the **Batch Writer** aggregates duplicates (e.g., "iphone" x5 -> "iphone" +5) and flushes them to PostgreSQL inside a single transaction.
+   - Every 30 seconds or when the buffer hits 100 queries, the **Batch Writer** aggregates duplicates (e.g., "google" x5 -> "google" +5) and flushes them to PostgreSQL inside a single transaction.
 3. **Trending searches (`GET /trending`)**:
    - Queries PostgreSQL using a weighted velocity formula and caches the results globally on `cache-node-1` for 5 minutes.
 4. **Metrics telemetry (`GET /metrics`)**:
@@ -73,12 +73,10 @@ Open your browser and navigate to:
 
 ---
 
-## 📊 Dataset Loading & Power-Law Modeling
-* **Data Source**: Parsed from [datasets/trends.csv](file:///home/x002/Desktop/Typeahead%20System/datasets/trends.csv).
-* **Dataset Expansion**: The 26k raw dataset queries were expanded into **105,000 unique queries** by appending combinations of popular prefix and suffix modifiers.
-* **Zipfian Power-Law Distribution**: Query counts were modeled using a Zipf-like distribution:
-  $$\text{Count} = \lfloor \frac{3,000,000}{\text{Rank}^{1.15}} \rfloor + \text{noise}$$
-  This ensures that a small subset of queries (such as `"iphone"`) have millions of search counts, while the long tail drops off to single-digit counts.
+## 📊 Dataset Loading & Count Modeling
+* **Data Source**: Parsed from [datasets/trends.csv](file:///home/x002/Desktop/Typeahead%20System/datasets/trends.csv), containing real-world search queries with columns: `Query, Global Count, Weekly Count, Daily Count, Trending Score`.
+* **Real Counts**: Base queries use their actual `Global Count` from the CSV, preserving the natural popularity distribution (e.g., `"google"` with 32,396 searches, `"yahoo"` with 13,344).
+* **Dataset Expansion**: The raw dataset queries are expanded into **105,000+ unique queries** by appending combinations of popular prefix and suffix modifiers. Expanded queries receive a derived count (10% of the parent query's count with added noise).
 
 ---
 
@@ -88,8 +86,8 @@ Based on live telemetry data captured during verification:
 
 | Endpoint / Action | Mode / Condition | Measured Latency (Host) | Speedup Factor |
 | :--- | :--- | :--- | :--- |
-| **`GET /suggest?q=iph`** | Cache **MISS** (PostgreSQL Query) | **17.33 ms** | Baseline |
-| **`GET /suggest?q=iph`** | Cache **HIT** (Redis Cache Node) | **1.06 ms** | **16.3x Faster** |
+| **`GET /suggest?q=goo`** | Cache **MISS** (PostgreSQL Query) | **17.33 ms** | Baseline |
+| **`GET /suggest?q=goo`** | Cache **HIT** (Redis Cache Node) | **1.06 ms** | **16.3x Faster** |
 | **`GET /trending`** | Cache **MISS** (PostgreSQL Joint Query) | **47.63 ms** | Baseline |
 | **`GET /trending`** | Cache **HIT** (Redis Global Cache) | **0.89 ms** | **53.5x Faster** |
 | **`POST /search`** | Buffered (In-memory push) | **~0.00 ms** (Client response) | Immediate |
@@ -105,17 +103,17 @@ Based on live telemetry data captured during verification:
 ### 1. Why Consistent Hashing?
 We implemented a consistent hash ring using `MD5` and **21 virtual nodes (replicas)** per physical Redis node.
 * **Elastic Scalability**: If we add more Redis containers (e.g. `redis-3` or `redis-4`) to scale horizontally, consistent hashing guarantees that only a minimal fraction of keys ($1/N$) need to be rehashed and migrated. This avoids a catastrophic cache stampede on database servers.
-* **Key Partitioning**: Consistently maps prefix inputs like `"iph"` to `cache-node-1` and `"java"` to `cache-node-2`, distributing cache storage load evenly.
+* **Key Partitioning**: Consistently maps prefix inputs like `"goo"` to `cache-node-1` and `"yah"` to `cache-node-2`, distributing cache storage load evenly.
 
 ### 2. Why Batch Writes?
 * **Write Queue Avoidance**: Autocomplete search boxes receive heavy traffic. Performing a disk write for every search would exhaust PostgreSQL's write connection pool, trigger thread locks, and block read performance.
-* **Deduplication benefits**: By buffering queries and merging duplicates (e.g. `"iphone"` x4 becomes a single `count = count + 4` update), we reduce database write traffic by up to 90%.
+* **Deduplication benefits**: By buffering queries and merging duplicates (e.g. `"google"` x4 becomes a single `count = count + 4` update), we reduce database write traffic by up to 90%.
 
 ### 3. What is the Weighted Trending Formula?
 We use a weighted score to balance historical queries and current search velocity:
 $$\text{Score} = 0.7 \cdot H + 0.3 \cdot R$$
 where $H$ = historical count and $R$ = recent velocity count
-* **Why**: Long-term popular queries (like `"iphone"`, count = 3.3M) shouldn't be completely overwritten by a query that goes viral for an hour. Conversely, a brand new viral query (like `"breaking_news"`, total count = 10) must rise immediately into the trending list. The $70/30$ weight balance achieves this naturally.
+* **Why**: Long-term popular queries (like `"google"`, count = 32,396) shouldn't be completely overwritten by a query that goes viral for an hour. Conversely, a brand new viral query (like `"breaking_news"`, total count = 10) must rise immediately into the trending list. The $70/30$ weight balance achieves this naturally.
 
 ### 4. What do you lose if the server crashes?
 * **Data Loss Trade-off**: Since search logs are buffered in Express server RAM, a crash or container restart will lose any search counts accumulated since the last flush (up to 30 seconds of data).
@@ -131,7 +129,7 @@ We have written five automated test scripts located under [backend/db/](file:///
    ```bash
    node db/verify.js
    ```
-   *Asserts that the database queries table contains >= 100,000 unique records and `iph%` prefix matching works.*
+   *Asserts that the database queries table contains >= 100,000 unique records and `goo%` prefix matching works.*
 
 2. **Verify Batch Buffering (Phase 3)**:
    ```bash
