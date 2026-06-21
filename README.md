@@ -1,4 +1,4 @@
-# AI-Powered Typeahead Search System
+# Typeahead Search System
 
 A highly optimized, full-stack typeahead search system built with React, Node.js (Express), PostgreSQL, and a multi-node Redis consistent hashing cache layer.
 
